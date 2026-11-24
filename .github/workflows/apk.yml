@@ -1,0 +1,266 @@
+name: apk
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Générer le projet Android
+        run: |
+          mkdir -p app/src/main/java/nc/lecteur/frames app/src/main/res/values
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'LecteurImages'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          EOF
+
+          echo "android.useAndroidX=false" > gradle.properties
+
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'nc.lecteur.frames'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'nc.lecteur.frames'
+                  minSdk 21
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources><string name="app_name">Lecteur images</string></resources>
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false"/>
+              <uses-feature android:name="android.software.leanback" android:required="false"/>
+              <application android:label="@string/app_name"
+                  android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+                  <activity android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="sensorLandscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER"/>
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.VIEW"/>
+                          <category android:name="android.intent.category.DEFAULT"/>
+                          <category android:name="android.intent.category.BROWSABLE"/>
+                          <data android:scheme="content"/>
+                          <data android:scheme="file"/>
+                          <data android:scheme="http"/>
+                          <data android:scheme="https"/>
+                          <data android:mimeType="video/*"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/nc/lecteur/frames/MainActivity.java <<'EOF'
+          package nc.lecteur.frames;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.media.MediaExtractor;
+          import android.media.MediaFormat;
+          import android.media.MediaPlayer;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.view.Gravity;
+          import android.view.KeyEvent;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.widget.FrameLayout;
+          import android.widget.Toast;
+          import android.widget.VideoView;
+
+          public class MainActivity extends Activity {
+              private VideoView v;
+              private MediaPlayer mp;
+              private double target = 0, frameMs = 40;
+              private int dur = 0, last = -1;
+              private boolean seeking = false;
+              private float lx, ly, acc, stepPx;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  stepPx = 12 * getResources().getDisplayMetrics().density;
+                  FrameLayout f = new FrameLayout(this);
+                  f.setBackgroundColor(0xFF000000);
+                  v = new VideoView(this);
+                  f.addView(v, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+                  setContentView(f);
+                  v.setOnPreparedListener(m -> {
+                      mp = m;
+                      dur = m.getDuration();
+                      target = 0;
+                      last = -1;
+                      seeking = false;
+                      m.setOnSeekCompleteListener(x -> { seeking = false; seekNow(); });
+                      m.setLooping(false);
+                      seekNow();
+                  });
+                  v.setOnErrorListener((m, w, e) -> {
+                      Toast.makeText(this, "Lecture impossible", Toast.LENGTH_LONG).show();
+                      return true;
+                  });
+                  Uri u = getIntent().getData();
+                  if (u != null) open(u); else pick();
+              }
+
+              private void open(Uri u) {
+                  fps(u);
+                  v.setVideoURI(u);
+              }
+
+              private void fps(Uri u) {
+                  MediaExtractor e = new MediaExtractor();
+                  try {
+                      e.setDataSource(this, u, null);
+                      for (int i = 0; i < e.getTrackCount(); i++) {
+                          MediaFormat f = e.getTrackFormat(i);
+                          String mime = f.getString(MediaFormat.KEY_MIME);
+                          if (mime != null && mime.startsWith("video/") && f.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                              float r;
+                              try { r = f.getInteger(MediaFormat.KEY_FRAME_RATE); }
+                              catch (Exception x) { r = f.getFloat(MediaFormat.KEY_FRAME_RATE); }
+                              if (r > 0) frameMs = 1000.0 / r;
+                              break;
+                          }
+                      }
+                  } catch (Exception x) {
+                  } finally {
+                      e.release();
+                  }
+              }
+
+              private void pick() {
+                  Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                  i.addCategory(Intent.CATEGORY_OPENABLE);
+                  i.setType("video/*");
+                  startActivityForResult(i, 1);
+              }
+
+              @Override
+              protected void onActivityResult(int rq, int rs, Intent d) {
+                  if (rs == RESULT_OK && d != null && d.getData() != null) open(d.getData());
+                  else finish();
+              }
+
+              private void seekNow() {
+                  if (mp == null || seeking) return;
+                  int t = (int) Math.round(target);
+                  if (t == last) return;
+                  last = t;
+                  seeking = true;
+                  if (Build.VERSION.SDK_INT >= 26) mp.seekTo(t, MediaPlayer.SEEK_CLOSEST);
+                  else mp.seekTo(t);
+              }
+
+              private void step(int n) {
+                  if (mp == null) return;
+                  if (v.isPlaying()) {
+                      v.pause();
+                      target = v.getCurrentPosition();
+                  }
+                  target = Math.max(0, Math.min(dur, target + n * frameMs));
+                  seekNow();
+              }
+
+              @Override
+              public boolean dispatchTouchEvent(MotionEvent e) {
+                  switch (e.getActionMasked()) {
+                      case MotionEvent.ACTION_DOWN:
+                          lx = e.getX(); ly = e.getY(); acc = 0;
+                          break;
+                      case MotionEvent.ACTION_MOVE:
+                          float dx = e.getX() - lx, dy = e.getY() - ly;
+                          lx = e.getX(); ly = e.getY();
+                          // haut ET bas = avance ; droite = avance, gauche = recule
+                          acc += Math.abs(dy) + dx;
+                          int n = (int) (acc / stepPx);
+                          if (n != 0) { acc -= n * stepPx; step(n); }
+                          break;
+                  }
+                  return true;
+              }
+
+              @Override
+              public void onWindowFocusChanged(boolean h) {
+                  super.onWindowFocusChanged(h);
+                  if (h) getWindow().getDecorView().setSystemUiVisibility(
+                      View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_FULLSCREEN
+                      | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                      | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+              }
+
+              @Override
+              public boolean onKeyDown(int k, KeyEvent e) {
+                  switch (k) {
+                      case KeyEvent.KEYCODE_DPAD_RIGHT:
+                      case KeyEvent.KEYCODE_DPAD_UP:
+                          step(1); return true;
+                      case KeyEvent.KEYCODE_DPAD_LEFT:
+                      case KeyEvent.KEYCODE_DPAD_DOWN:
+                          step(-1); return true;
+                      case KeyEvent.KEYCODE_DPAD_CENTER:
+                      case KeyEvent.KEYCODE_ENTER:
+                      case KeyEvent.KEYCODE_SPACE:
+                      case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
+                          if (v.isPlaying()) v.pause();
+                          else { target = v.getCurrentPosition(); v.start(); }
+                          return true;
+                  }
+                  return super.onKeyDown(k, e);
+              }
+          }
+          EOF
+
+      - name: Compiler
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Lecteur_images
+          path: app/build/outputs/apk/debug/app-debug.apk
