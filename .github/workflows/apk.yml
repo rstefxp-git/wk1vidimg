@@ -20,7 +20,7 @@ jobs:
 
       - name: Générer le projet Android
         run: |
-          mkdir -p app/src/main/java/nc/lecteur/frames app/src/main/res/values
+          mkdir -p app/src/main/java/nc/lecteur/marques app/src/main/res/values
 
           cat > settings.gradle <<'EOF'
           pluginManagement {
@@ -29,7 +29,7 @@ jobs:
           dependencyResolutionManagement {
               repositories { google(); mavenCentral() }
           }
-          rootProject.name = 'LecteurImages'
+          rootProject.name = 'LecteurMarques'
           include ':app'
           EOF
 
@@ -42,14 +42,14 @@ jobs:
           cat > app/build.gradle <<'EOF'
           plugins { id 'com.android.application' }
           android {
-              namespace 'nc.lecteur.frames'
+              namespace 'nc.lecteur.marques'
               compileSdk 34
               defaultConfig {
-                  applicationId 'nc.lecteur.frames'
+                  applicationId 'nc.lecteur.marques'
                   minSdk 21
                   targetSdk 34
-                  versionCode 1
-                  versionName '1.0'
+                  versionCode 2
+                  versionName '2.0'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
@@ -59,7 +59,7 @@ jobs:
           EOF
 
           cat > app/src/main/res/values/strings.xml <<'EOF'
-          <resources><string name="app_name">Lecteur images</string></resources>
+          <resources><string name="app_name">Lecteur marques</string></resources>
           EOF
 
           cat > app/src/main/AndroidManifest.xml <<'EOF'
@@ -93,65 +93,231 @@ jobs:
           </manifest>
           EOF
 
-          cat > app/src/main/java/nc/lecteur/frames/MainActivity.java <<'EOF'
-          package nc.lecteur.frames;
+          cat > app/src/main/java/nc/lecteur/marques/MainActivity.java <<'EOF'
+          package nc.lecteur.marques;
 
           import android.app.Activity;
+          import android.content.ContentUris;
+          import android.content.ContentValues;
           import android.content.Intent;
+          import android.database.Cursor;
+          import android.graphics.Bitmap;
           import android.media.MediaExtractor;
           import android.media.MediaFormat;
+          import android.media.MediaMetadataRetriever;
           import android.media.MediaPlayer;
           import android.net.Uri;
           import android.os.Build;
           import android.os.Bundle;
+          import android.os.Environment;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.MediaStore;
+          import android.provider.OpenableColumns;
           import android.view.Gravity;
           import android.view.KeyEvent;
           import android.view.MotionEvent;
           import android.view.View;
           import android.view.WindowManager;
+          import android.widget.Button;
           import android.widget.FrameLayout;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
           import android.widget.Toast;
           import android.widget.VideoView;
+
+          import java.io.BufferedReader;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.FileReader;
+          import java.io.OutputStream;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Locale;
 
           public class MainActivity extends Activity {
               private VideoView v;
               private MediaPlayer mp;
+              private TextView tv;
+              private Button bPlay, bBatch;
+              private LinearLayout bar;
+              private Toast toast;
+              private Uri uri;
+              private String base = "video";
               private double target = 0, frameMs = 40;
-              private int dur = 0, last = -1;
-              private boolean seeking = false;
-              private float lx, ly, acc, stepPx;
+              private int dur = 0, rdir = 0, resume = 0, downMs = 0, axis = 0;
+              private volatile int posSnap = 0;
+              private boolean seeking = false, dirty = false, overBar = false;
+              private float lx, downX, downY, accX, stepPx, slopPx, upPx;
+              private final Object lock = new Object();
+              private final Object logLock = new Object();
+              private final ArrayList<Integer> marks = new ArrayList<>();
+              private final ArrayList<Integer> exported = new ArrayList<>();
+              private final Handler h = new Handler(Looper.getMainLooper());
+
+              private final Runnable rep = new Runnable() {
+                  public void run() { step(rdir); h.postDelayed(this, 70); }
+              };
+              private final Runnable tick = new Runnable() {
+                  public void run() { refresh(); h.postDelayed(this, 100); }
+              };
 
               @Override
               protected void onCreate(Bundle b) {
                   super.onCreate(b);
                   getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                  stepPx = 12 * getResources().getDisplayMetrics().density;
-                  FrameLayout f = new FrameLayout(this);
-                  f.setBackgroundColor(0xFF000000);
+                  float d = getResources().getDisplayMetrics().density;
+                  stepPx = 10 * d;
+                  slopPx = 8 * d;
+                  upPx = 40 * d;
+
+                  FrameLayout root = new FrameLayout(this);
+                  root.setBackgroundColor(0xFF000000);
                   v = new VideoView(this);
-                  f.addView(v, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
-                  setContentView(f);
+                  root.addView(v, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+
+                  bar = new LinearLayout(this);
+                  bar.setOrientation(LinearLayout.VERTICAL);
+                  bar.setBackgroundColor(0x99000000);
+                  tv = new TextView(this);
+                  tv.setTextColor(0xFFFFFFFF);
+                  tv.setTextSize(14);
+                  tv.setGravity(Gravity.CENTER);
+                  bar.addView(tv, new LinearLayout.LayoutParams(-1, -2));
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  Button bBack = btn("-1"), bFwd = btn("+1"), bPng = btn("PNG"), bMark = btn("Marquer");
+                  bPlay = btn("Pause");
+                  bBatch = btn("Lot (0)");
+                  for (Button x : new Button[]{bBack, bPlay, bFwd, bPng, bMark, bBatch})
+                      row.addView(x, new LinearLayout.LayoutParams(0, -2, 1));
+                  bar.addView(row, new LinearLayout.LayoutParams(-1, -2));
+                  root.addView(bar, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
+                  setContentView(root);
+
+                  hold(bBack, -1);
+                  hold(bFwd, 1);
+                  bPlay.setOnClickListener(x -> togglePlay());
+                  bPng.setOnClickListener(x -> exportAsync(single()));
+                  bMark.setOnClickListener(x -> toggleMark(curMs()));
+                  bBatch.setOnClickListener(x -> {
+                      ArrayList<Integer> p = pending();
+                      if (p.isEmpty()) {
+                          toast(markCount() == 0 ? "Aucune marque" : "Tout est deja exporte (appui long = reinitialiser)", false);
+                          return;
+                      }
+                      exportAsync(p);
+                  });
+                  bBatch.setOnLongClickListener(x -> {
+                      synchronized (lock) { marks.clear(); exported.clear(); }
+                      saveLogAsync();
+                      toast("Marques et log reinitialises", false);
+                      return true;
+                  });
+
                   v.setOnPreparedListener(m -> {
                       mp = m;
                       dur = m.getDuration();
-                      target = 0;
-                      last = -1;
                       seeking = false;
                       m.setOnSeekCompleteListener(x -> { seeking = false; seekNow(); });
-                      m.setLooping(false);
-                      seekNow();
+                      if (resume > 0 && resume < dur - 2 * frameMs) {
+                          target = resume;
+                          dirty = true;
+                          seekNow();
+                          toast("Reprise " + fmt(resume), false);
+                      } else {
+                          target = 0;
+                          dirty = false;
+                          v.start();
+                      }
+                      resume = 0;
                   });
+                  v.setOnCompletionListener(m -> { target = dur; dirty = false; });
                   v.setOnErrorListener((m, w, e) -> {
-                      Toast.makeText(this, "Lecture impossible", Toast.LENGTH_LONG).show();
+                      toast("Lecture impossible", false);
                       return true;
                   });
+
                   Uri u = getIntent().getData();
                   if (u != null) open(u); else pick();
+                  h.post(tick);
               }
 
+              @Override
+              protected void onPause() {
+                  posSnap = curMs();
+                  saveLog();
+                  super.onPause();
+              }
+
+              @Override
+              protected void onDestroy() {
+                  h.removeCallbacksAndMessages(null);
+                  super.onDestroy();
+              }
+
+              private Button btn(String t) {
+                  Button b = new Button(this);
+                  b.setText(t);
+                  b.setAllCaps(false);
+                  b.setTextSize(13);
+                  b.setFocusable(false);
+                  b.setPadding(0, 0, 0, 0);
+                  return b;
+              }
+
+              private void hold(Button b, final int dir) {
+                  b.setOnTouchListener((x, e) -> {
+                      switch (e.getActionMasked()) {
+                          case MotionEvent.ACTION_DOWN:
+                              rdir = dir;
+                              step(dir);
+                              h.postDelayed(rep, 350);
+                              break;
+                          case MotionEvent.ACTION_UP:
+                          case MotionEvent.ACTION_CANCEL:
+                              h.removeCallbacks(rep);
+                              break;
+                      }
+                      return true;
+                  });
+              }
+
+              private void toast(String s, boolean lg) {
+                  if (toast != null) toast.cancel();
+                  toast = Toast.makeText(this, s, lg ? Toast.LENGTH_LONG : Toast.LENGTH_SHORT);
+                  toast.show();
+              }
+
+              // ---------- ouverture ----------
               private void open(Uri u) {
+                  uri = u;
+                  base = name(u);
                   fps(u);
+                  loadLog();
                   v.setVideoURI(u);
+              }
+
+              private String name(Uri u) {
+                  String n = null;
+                  try {
+                      if ("content".equals(u.getScheme())) {
+                          Cursor c = getContentResolver().query(u, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null);
+                          if (c != null) {
+                              if (c.moveToFirst()) n = c.getString(0);
+                              c.close();
+                          }
+                      }
+                  } catch (Exception x) {
+                  }
+                  if (n == null) n = u.getLastPathSegment();
+                  if (n == null) n = "video";
+                  int i = n.lastIndexOf('.');
+                  if (i > 0) n = n.substring(0, i);
+                  n = n.replaceAll("[^\\w.-]", "_");
+                  return n.isEmpty() ? "video" : n;
               }
 
               private void fps(Uri u) {
@@ -188,48 +354,323 @@ jobs:
                   else finish();
               }
 
+              // ---------- lecture / seek ----------
+              private double clamp(double x) {
+                  return Math.max(0, Math.min(dur, x));
+              }
+
+              private int curMs() {
+                  if (v.isPlaying() && !(seeking || dirty)) return v.getCurrentPosition();
+                  return (int) Math.round(target);
+              }
+
+              private void togglePlay() {
+                  if (v.isPlaying()) {
+                      if (!(seeking || dirty)) target = v.getCurrentPosition();
+                      v.pause();
+                      saveLogAsync();
+                  } else {
+                      v.start();
+                  }
+              }
+
               private void seekNow() {
-                  if (mp == null || seeking) return;
-                  int t = (int) Math.round(target);
-                  if (t == last) return;
-                  last = t;
+                  if (mp == null || seeking || !dirty) return;
+                  dirty = false;
                   seeking = true;
+                  int t = (int) Math.round(target);
                   if (Build.VERSION.SDK_INT >= 26) mp.seekTo(t, MediaPlayer.SEEK_CLOSEST);
                   else mp.seekTo(t);
               }
 
+              // image par image (met en pause)
               private void step(int n) {
                   if (mp == null) return;
-                  if (v.isPlaying()) {
-                      v.pause();
-                      target = v.getCurrentPosition();
-                  }
-                  target = Math.max(0, Math.min(dur, target + n * frameMs));
+                  double b = (seeking || dirty) ? target : (v.isPlaying() ? v.getCurrentPosition() : target);
+                  if (v.isPlaying()) v.pause();
+                  target = clamp(b + n * frameMs);
+                  dirty = true;
                   seekNow();
               }
 
+              // seek en temps, sans interrompre la lecture
+              private void timeSeek(int n) {
+                  if (mp == null) return;
+                  double b = (seeking || dirty) ? target : v.getCurrentPosition();
+                  target = clamp(b + n * 1000.0);
+                  dirty = true;
+                  seekNow();
+              }
+
+              // geste lateral : lecture = seek en temps, pause = image par image
+              private void lateral(int n) {
+                  if (v.isPlaying()) timeSeek(n); else step(n);
+              }
+
+              private void refresh() {
+                  posSnap = curMs();
+                  int tot = markCount(), pend = pending().size();
+                  tv.setText(fmt(posSnap) + " / " + fmt(dur) + "    marques : " + tot + " (" + pend + " a exporter)");
+                  bPlay.setText(v.isPlaying() ? "Pause" : "Lecture");
+                  bBatch.setText("Lot (" + pend + ")");
+              }
+
+              private String fmt(int ms) {
+                  int s = ms / 1000;
+                  return String.format(Locale.US, "%d:%02d:%02d.%03d", s / 3600, (s / 60) % 60, s % 60, ms % 1000);
+              }
+
+              private String fmtFile(int ms) {
+                  int s = ms / 1000;
+                  return String.format(Locale.US, "%02d-%02d-%02d-%03d", s / 3600, (s / 60) % 60, s % 60, ms % 1000);
+              }
+
+              // ---------- marques ----------
+              private int markCount() {
+                  synchronized (lock) { return marks.size(); }
+              }
+
+              private ArrayList<Integer> pending() {
+                  ArrayList<Integer> p = new ArrayList<>();
+                  synchronized (lock) {
+                      for (int t : marks) if (!exported.contains(t)) p.add(t);
+                  }
+                  return p;
+              }
+
+              private void toggleMark(int t) {
+                  boolean added = true;
+                  synchronized (lock) {
+                      for (int i = 0; i < marks.size(); i++) {
+                          if (Math.abs(marks.get(i) - t) <= frameMs / 2) {
+                              marks.remove(i);
+                              added = false;
+                              break;
+                          }
+                      }
+                      if (added) {
+                          marks.add(t);
+                          Collections.sort(marks);
+                      }
+                  }
+                  toast((added ? "Marque + " : "Marque - ") + fmt(t), false);
+                  saveLogAsync();
+              }
+
+              private List<Integer> single() {
+                  List<Integer> l = new ArrayList<>();
+                  l.add(curMs());
+                  return l;
+              }
+
+              // ---------- log .txt (reprise) ----------
+              private void loadLog() {
+                  resume = 0;
+                  synchronized (lock) { marks.clear(); exported.clear(); }
+                  File f = new File(getFilesDir(), base + ".txt");
+                  if (!f.exists()) return;
+                  try {
+                      BufferedReader r = new BufferedReader(new FileReader(f));
+                      String s;
+                      while ((s = r.readLine()) != null) {
+                          try {
+                              if (s.startsWith("pos=")) {
+                                  resume = Integer.parseInt(s.substring(4).trim());
+                              } else if (s.startsWith("mark=")) {
+                                  int t = Integer.parseInt(s.substring(5).split(" ")[0]);
+                                  synchronized (lock) { marks.add(t); }
+                              } else if (s.startsWith("png=")) {
+                                  int t = Integer.parseInt(s.substring(4).split(" ")[0]);
+                                  synchronized (lock) { exported.add(t); }
+                              }
+                          } catch (Exception x) {
+                          }
+                      }
+                      r.close();
+                  } catch (Exception x) {
+                  }
+                  synchronized (lock) { Collections.sort(marks); }
+              }
+
+              private void saveLogAsync() {
+                  posSnap = curMs();
+                  new Thread(this::saveLog).start();
+              }
+
+              private void saveLog() {
+                  if (uri == null) return;
+                  StringBuilder s = new StringBuilder("# Lecteur marques - ").append(base).append("\n");
+                  s.append("pos=").append(posSnap).append("\n");
+                  synchronized (lock) {
+                      for (int t : marks) s.append("mark=").append(t).append(' ').append(fmt(t)).append('\n');
+                      for (int t : exported)
+                          s.append("png=").append(t).append(' ').append(base).append('_').append(fmtFile(t)).append(".png\n");
+                  }
+                  String text = s.toString();
+                  synchronized (logLock) {
+                      try {
+                          FileOutputStream o = new FileOutputStream(new File(getFilesDir(), base + ".txt"));
+                          o.write(text.getBytes("UTF-8"));
+                          o.close();
+                      } catch (Exception x) {
+                      }
+                      mirror(base + ".txt", text);
+                  }
+              }
+
+              // copie visible : Download/LecteurMarques/<video>.txt
+              private void mirror(String name, String text) {
+                  try {
+                      byte[] b = text.getBytes("UTF-8");
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          Uri col = MediaStore.Downloads.EXTERNAL_CONTENT_URI;
+                          Uri t = null;
+                          Cursor c = getContentResolver().query(col, new String[]{MediaStore.MediaColumns._ID},
+                              MediaStore.MediaColumns.DISPLAY_NAME + "=? AND " + MediaStore.MediaColumns.RELATIVE_PATH + "=?",
+                              new String[]{name, "Download/LecteurMarques/"}, null);
+                          if (c != null) {
+                              if (c.moveToFirst()) t = ContentUris.withAppendedId(col, c.getLong(0));
+                              c.close();
+                          }
+                          if (t == null) {
+                              ContentValues cv = new ContentValues();
+                              cv.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+                              cv.put(MediaStore.MediaColumns.MIME_TYPE, "text/plain");
+                              cv.put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/LecteurMarques");
+                              t = getContentResolver().insert(col, cv);
+                          }
+                          if (t == null) return;
+                          OutputStream os = getContentResolver().openOutputStream(t, "wt");
+                          os.write(b);
+                          os.close();
+                      } else {
+                          File d = getExternalFilesDir(null);
+                          FileOutputStream os = new FileOutputStream(new File(d, name));
+                          os.write(b);
+                          os.close();
+                      }
+                  } catch (Exception x) {
+                  }
+              }
+
+              // ---------- export PNG ----------
+              private void exportAsync(final List<Integer> l) {
+                  if (uri == null || l.isEmpty()) return;
+                  toast("Export...", false);
+                  new Thread(() -> {
+                      int ok = exportMs(l);
+                      runOnUiThread(() -> toast(ok + "/" + l.size() + " PNG - " + where(), true));
+                  }).start();
+              }
+
+              private String where() {
+                  if (Build.VERSION.SDK_INT >= 29) return "Pictures/LecteurMarques";
+                  File d = getExternalFilesDir(Environment.DIRECTORY_PICTURES);
+                  return d == null ? "?" : d.getAbsolutePath();
+              }
+
+              private int exportMs(List<Integer> l) {
+                  int ok = 0;
+                  MediaMetadataRetriever r = new MediaMetadataRetriever();
+                  try {
+                      String sc = uri.getScheme();
+                      if ("http".equals(sc) || "https".equals(sc))
+                          r.setDataSource(uri.toString(), new HashMap<String, String>());
+                      else
+                          r.setDataSource(this, uri);
+                      for (int t : l) {
+                          Bitmap bm = r.getFrameAtTime(t * 1000L, MediaMetadataRetriever.OPTION_CLOSEST);
+                          if (bm == null) continue;
+                          boolean s = save(bm, base + "_" + fmtFile(t));
+                          bm.recycle();
+                          if (s) {
+                              ok++;
+                              synchronized (lock) { if (!exported.contains(t)) exported.add(t); }
+                              saveLog();
+                          }
+                      }
+                  } catch (Exception x) {
+                  } finally {
+                      try { r.release(); } catch (Exception x) { }
+                  }
+                  return ok;
+              }
+
+              private boolean save(Bitmap bm, String name) {
+                  try {
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          ContentValues cv = new ContentValues();
+                          cv.put(MediaStore.Images.Media.DISPLAY_NAME, name + ".png");
+                          cv.put(MediaStore.Images.Media.MIME_TYPE, "image/png");
+                          cv.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/LecteurMarques");
+                          cv.put(MediaStore.Images.Media.IS_PENDING, 1);
+                          Uri o = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv);
+                          if (o == null) return false;
+                          OutputStream os = getContentResolver().openOutputStream(o);
+                          bm.compress(Bitmap.CompressFormat.PNG, 100, os);
+                          os.close();
+                          cv.clear();
+                          cv.put(MediaStore.Images.Media.IS_PENDING, 0);
+                          getContentResolver().update(o, cv, null, null);
+                      } else {
+                          File d = getExternalFilesDir(Environment.DIRECTORY_PICTURES);
+                          FileOutputStream os = new FileOutputStream(new File(d, name + ".png"));
+                          bm.compress(Bitmap.CompressFormat.PNG, 100, os);
+                          os.close();
+                      }
+                      return true;
+                  } catch (Exception x) {
+                      return false;
+                  }
+              }
+
+              // ---------- gestes ----------
+              // lateral = seek, haut = marquer, tap = pause/lecture
               @Override
               public boolean dispatchTouchEvent(MotionEvent e) {
-                  switch (e.getActionMasked()) {
+                  int a = e.getActionMasked();
+                  if (a == MotionEvent.ACTION_DOWN)
+                      overBar = e.getY() >= bar.getTop();
+                  if (overBar) return super.dispatchTouchEvent(e);
+                  float x = e.getX(), y = e.getY();
+                  switch (a) {
                       case MotionEvent.ACTION_DOWN:
-                          lx = e.getX(); ly = e.getY(); acc = 0;
+                          lx = downX = x;
+                          downY = y;
+                          accX = 0;
+                          axis = 0;
+                          downMs = curMs();
                           break;
                       case MotionEvent.ACTION_MOVE:
-                          float dx = e.getX() - lx, dy = e.getY() - ly;
-                          lx = e.getX(); ly = e.getY();
-                          // haut ET bas = avance ; droite = avance, gauche = recule
-                          acc += Math.abs(dy) + dx;
-                          int n = (int) (acc / stepPx);
-                          if (n != 0) { acc -= n * stepPx; step(n); }
+                          if (axis == 0) {
+                              float adx = Math.abs(x - downX), ady = Math.abs(y - downY);
+                              if (Math.max(adx, ady) > slopPx) {
+                                  axis = adx >= ady ? 1 : 2;
+                                  lx = downX;
+                              }
+                          }
+                          if (axis == 1) {
+                              accX += x - lx;
+                              lx = x;
+                              int n = (int) (accX / stepPx);
+                              if (n != 0) {
+                                  accX -= n * stepPx;
+                                  lateral(n);
+                              }
+                          }
+                          break;
+                      case MotionEvent.ACTION_UP:
+                          if (axis == 0) togglePlay();
+                          else if (axis == 2 && downY - y > upPx) toggleMark(downMs);
                           break;
                   }
                   return true;
               }
 
               @Override
-              public void onWindowFocusChanged(boolean h) {
-                  super.onWindowFocusChanged(h);
-                  if (h) getWindow().getDecorView().setSystemUiVisibility(
+              public void onWindowFocusChanged(boolean hasFocus) {
+                  super.onWindowFocusChanged(hasFocus);
+                  if (hasFocus) getWindow().getDecorView().setSystemUiVisibility(
                       View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_FULLSCREEN
                       | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                       | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
@@ -238,18 +679,22 @@ jobs:
               @Override
               public boolean onKeyDown(int k, KeyEvent e) {
                   switch (k) {
-                      case KeyEvent.KEYCODE_DPAD_RIGHT:
+                      case KeyEvent.KEYCODE_DPAD_RIGHT: step(1); return true;
+                      case KeyEvent.KEYCODE_DPAD_LEFT: step(-1); return true;
                       case KeyEvent.KEYCODE_DPAD_UP:
-                          step(1); return true;
-                      case KeyEvent.KEYCODE_DPAD_LEFT:
+                          if (e.getRepeatCount() == 0) toggleMark(curMs());
+                          return true;
                       case KeyEvent.KEYCODE_DPAD_DOWN:
-                          step(-1); return true;
+                          if (e.getRepeatCount() == 0) exportAsync(single());
+                          return true;
+                      case KeyEvent.KEYCODE_MENU:
+                          exportAsync(pending());
+                          return true;
                       case KeyEvent.KEYCODE_DPAD_CENTER:
                       case KeyEvent.KEYCODE_ENTER:
                       case KeyEvent.KEYCODE_SPACE:
                       case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
-                          if (v.isPlaying()) v.pause();
-                          else { target = v.getCurrentPosition(); v.start(); }
+                          if (e.getRepeatCount() == 0) togglePlay();
                           return true;
                   }
                   return super.onKeyDown(k, e);
@@ -262,5 +707,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Lecteur_images
+          name: Lecteur_marques
           path: app/build/outputs/apk/debug/app-debug.apk
