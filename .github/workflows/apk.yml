@@ -48,8 +48,8 @@ jobs:
                   applicationId 'nc.lecteur.marques'
                   minSdk 21
                   targetSdk 34
-                  versionCode 2
-                  versionName '2.0'
+                  versionCode 3
+                  versionName '3.0'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
@@ -119,9 +119,7 @@ jobs:
           import android.view.MotionEvent;
           import android.view.View;
           import android.view.WindowManager;
-          import android.widget.Button;
           import android.widget.FrameLayout;
-          import android.widget.LinearLayout;
           import android.widget.TextView;
           import android.widget.Toast;
           import android.widget.VideoView;
@@ -141,15 +139,13 @@ jobs:
               private VideoView v;
               private MediaPlayer mp;
               private TextView tv;
-              private Button bPlay, bBatch;
-              private LinearLayout bar;
               private Toast toast;
               private Uri uri;
               private String base = "video";
               private double target = 0, frameMs = 40;
-              private int dur = 0, rdir = 0, resume = 0, downMs = 0, axis = 0;
+              private int dur = 0, resume = 0, downMs = 0, axis = 0;
               private volatile int posSnap = 0;
-              private boolean seeking = false, dirty = false, overBar = false;
+              private boolean seeking = false, dirty = false, resumeMark = false, longFired = false;
               private float lx, downX, downY, accX, stepPx, slopPx, upPx;
               private final Object lock = new Object();
               private final Object logLock = new Object();
@@ -157,11 +153,17 @@ jobs:
               private final ArrayList<Integer> exported = new ArrayList<>();
               private final Handler h = new Handler(Looper.getMainLooper());
 
-              private final Runnable rep = new Runnable() {
-                  public void run() { step(rdir); h.postDelayed(this, 70); }
-              };
               private final Runnable tick = new Runnable() {
                   public void run() { refresh(); h.postDelayed(this, 100); }
+              };
+              // appui long = export du lot (marques pas encore exportees)
+              private final Runnable longPress = new Runnable() {
+                  public void run() {
+                      longFired = true;
+                      ArrayList<Integer> p = pending();
+                      if (p.isEmpty()) toast(markCount() == 0 ? "Aucune marque" : "Tout est deja exporte", false);
+                      else exportAsync(p);
+                  }
               };
 
               @Override
@@ -178,52 +180,22 @@ jobs:
                   v = new VideoView(this);
                   root.addView(v, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
 
-                  bar = new LinearLayout(this);
-                  bar.setOrientation(LinearLayout.VERTICAL);
-                  bar.setBackgroundColor(0x99000000);
                   tv = new TextView(this);
                   tv.setTextColor(0xFFFFFFFF);
-                  tv.setTextSize(14);
+                  tv.setTextSize(12);
                   tv.setGravity(Gravity.CENTER);
-                  bar.addView(tv, new LinearLayout.LayoutParams(-1, -2));
-                  LinearLayout row = new LinearLayout(this);
-                  row.setOrientation(LinearLayout.HORIZONTAL);
-                  Button bBack = btn("-1"), bFwd = btn("+1"), bPng = btn("PNG"), bMark = btn("Marquer");
-                  bPlay = btn("Pause");
-                  bBatch = btn("Lot (0)");
-                  for (Button x : new Button[]{bBack, bPlay, bFwd, bPng, bMark, bBatch})
-                      row.addView(x, new LinearLayout.LayoutParams(0, -2, 1));
-                  bar.addView(row, new LinearLayout.LayoutParams(-1, -2));
-                  root.addView(bar, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
+                  tv.setBackgroundColor(0x66000000);
+                  tv.setPadding(0, (int) (2 * d), 0, (int) (2 * d));
+                  root.addView(tv, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
                   setContentView(root);
-
-                  hold(bBack, -1);
-                  hold(bFwd, 1);
-                  bPlay.setOnClickListener(x -> togglePlay());
-                  bPng.setOnClickListener(x -> exportAsync(single()));
-                  bMark.setOnClickListener(x -> toggleMark(curMs()));
-                  bBatch.setOnClickListener(x -> {
-                      ArrayList<Integer> p = pending();
-                      if (p.isEmpty()) {
-                          toast(markCount() == 0 ? "Aucune marque" : "Tout est deja exporte (appui long = reinitialiser)", false);
-                          return;
-                      }
-                      exportAsync(p);
-                  });
-                  bBatch.setOnLongClickListener(x -> {
-                      synchronized (lock) { marks.clear(); exported.clear(); }
-                      saveLogAsync();
-                      toast("Marques et log reinitialises", false);
-                      return true;
-                  });
 
                   v.setOnPreparedListener(m -> {
                       mp = m;
                       dur = m.getDuration();
                       seeking = false;
                       m.setOnSeekCompleteListener(x -> { seeking = false; seekNow(); });
-                      if (resume > 0 && resume < dur - 2 * frameMs) {
-                          target = resume;
+                      if (resume > 0 && (resumeMark || resume < dur - 2 * frameMs)) {
+                          target = clamp(resume);
                           dirty = true;
                           seekNow();
                           toast("Reprise " + fmt(resume), false);
@@ -256,33 +228,6 @@ jobs:
               protected void onDestroy() {
                   h.removeCallbacksAndMessages(null);
                   super.onDestroy();
-              }
-
-              private Button btn(String t) {
-                  Button b = new Button(this);
-                  b.setText(t);
-                  b.setAllCaps(false);
-                  b.setTextSize(13);
-                  b.setFocusable(false);
-                  b.setPadding(0, 0, 0, 0);
-                  return b;
-              }
-
-              private void hold(Button b, final int dir) {
-                  b.setOnTouchListener((x, e) -> {
-                      switch (e.getActionMasked()) {
-                          case MotionEvent.ACTION_DOWN:
-                              rdir = dir;
-                              step(dir);
-                              h.postDelayed(rep, 350);
-                              break;
-                          case MotionEvent.ACTION_UP:
-                          case MotionEvent.ACTION_CANCEL:
-                              h.removeCallbacks(rep);
-                              break;
-                      }
-                      return true;
-                  });
               }
 
               private void toast(String s, boolean lg) {
@@ -411,8 +356,6 @@ jobs:
                   posSnap = curMs();
                   int tot = markCount(), pend = pending().size();
                   tv.setText(fmt(posSnap) + " / " + fmt(dur) + "    marques : " + tot + " (" + pend + " a exporter)");
-                  bPlay.setText(v.isPlaying() ? "Pause" : "Lecture");
-                  bBatch.setText("Lot (" + pend + ")");
               }
 
               private String fmt(int ms) {
@@ -425,7 +368,7 @@ jobs:
                   return String.format(Locale.US, "%02d-%02d-%02d-%03d", s / 3600, (s / 60) % 60, s % 60, ms % 1000);
               }
 
-              // ---------- marques ----------
+              // ---------- marques (jamais supprimees) ----------
               private int markCount() {
                   synchronized (lock) { return marks.size(); }
               }
@@ -438,34 +381,31 @@ jobs:
                   return p;
               }
 
-              private void toggleMark(int t) {
+              private void addMark(int t) {
                   boolean added = true;
                   synchronized (lock) {
-                      for (int i = 0; i < marks.size(); i++) {
-                          if (Math.abs(marks.get(i) - t) <= frameMs / 2) {
-                              marks.remove(i);
-                              added = false;
-                              break;
-                          }
+                      for (int m : marks) {
+                          if (Math.abs(m - t) <= frameMs / 2) { added = false; break; }
                       }
                       if (added) {
                           marks.add(t);
                           Collections.sort(marks);
                       }
                   }
-                  toast((added ? "Marque + " : "Marque - ") + fmt(t), false);
-                  saveLogAsync();
+                  toast((added ? "Marque " : "Deja marquee ") + fmt(t), false);
+                  if (added) saveLogAsync();
               }
 
-              private List<Integer> single() {
+              private List<Integer> one(int ms) {
                   List<Integer> l = new ArrayList<>();
-                  l.add(curMs());
+                  l.add(ms);
                   return l;
               }
 
-              // ---------- log .txt (reprise) ----------
+              // ---------- log .txt (jamais d'entree supprimee) ----------
               private void loadLog() {
                   resume = 0;
+                  resumeMark = false;
                   synchronized (lock) { marks.clear(); exported.clear(); }
                   File f = new File(getFilesDir(), base + ".txt");
                   if (!f.exists()) return;
@@ -489,7 +429,14 @@ jobs:
                       r.close();
                   } catch (Exception x) {
                   }
-                  synchronized (lock) { Collections.sort(marks); }
+                  synchronized (lock) {
+                      Collections.sort(marks);
+                      // reprise : marque la plus avancee
+                      if (!marks.isEmpty()) {
+                          resume = marks.get(marks.size() - 1);
+                          resumeMark = true;
+                      }
+                  }
               }
 
               private void saveLogAsync() {
@@ -625,21 +572,20 @@ jobs:
               }
 
               // ---------- gestes ----------
-              // lateral = seek, haut = marquer, tap = pause/lecture
+              // tap gauche -1 | tap droite +1 | tap centre pause/lecture
+              // lateral = seek | haut = marquer | bas = sauver l'image | appui long = export du lot
               @Override
               public boolean dispatchTouchEvent(MotionEvent e) {
-                  int a = e.getActionMasked();
-                  if (a == MotionEvent.ACTION_DOWN)
-                      overBar = e.getY() >= bar.getTop();
-                  if (overBar) return super.dispatchTouchEvent(e);
                   float x = e.getX(), y = e.getY();
-                  switch (a) {
+                  switch (e.getActionMasked()) {
                       case MotionEvent.ACTION_DOWN:
                           lx = downX = x;
                           downY = y;
                           accX = 0;
                           axis = 0;
+                          longFired = false;
                           downMs = curMs();
+                          h.postDelayed(longPress, 700);
                           break;
                       case MotionEvent.ACTION_MOVE:
                           if (axis == 0) {
@@ -647,6 +593,7 @@ jobs:
                               if (Math.max(adx, ady) > slopPx) {
                                   axis = adx >= ady ? 1 : 2;
                                   lx = downX;
+                                  h.removeCallbacks(longPress);
                               }
                           }
                           if (axis == 1) {
@@ -660,8 +607,20 @@ jobs:
                           }
                           break;
                       case MotionEvent.ACTION_UP:
-                          if (axis == 0) togglePlay();
-                          else if (axis == 2 && downY - y > upPx) toggleMark(downMs);
+                          h.removeCallbacks(longPress);
+                          if (longFired) break;
+                          if (axis == 0) {
+                              float w = getWindow().getDecorView().getWidth();
+                              if (x < 0.35f * w) step(-1);
+                              else if (x > 0.65f * w) step(1);
+                              else togglePlay();
+                          } else if (axis == 2) {
+                              if (downY - y > upPx) addMark(downMs);
+                              else if (y - downY > upPx) exportAsync(one(downMs));
+                          }
+                          break;
+                      case MotionEvent.ACTION_CANCEL:
+                          h.removeCallbacks(longPress);
                           break;
                   }
                   return true;
@@ -682,10 +641,10 @@ jobs:
                       case KeyEvent.KEYCODE_DPAD_RIGHT: step(1); return true;
                       case KeyEvent.KEYCODE_DPAD_LEFT: step(-1); return true;
                       case KeyEvent.KEYCODE_DPAD_UP:
-                          if (e.getRepeatCount() == 0) toggleMark(curMs());
+                          if (e.getRepeatCount() == 0) addMark(curMs());
                           return true;
                       case KeyEvent.KEYCODE_DPAD_DOWN:
-                          if (e.getRepeatCount() == 0) exportAsync(single());
+                          if (e.getRepeatCount() == 0) exportAsync(one(curMs()));
                           return true;
                       case KeyEvent.KEYCODE_MENU:
                           exportAsync(pending());
